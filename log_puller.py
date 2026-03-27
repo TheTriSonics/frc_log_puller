@@ -76,6 +76,8 @@ class LogPullerApp:
         self._build_gui()
         self._apply_config()
         self._scan_existing_downloads()
+        self._show_local_logs()
+        self._queue_video_lookups()
         self._start_polling()
 
     def _build_gui(self):
@@ -134,7 +136,7 @@ class LogPullerApp:
         settings_frame.columnconfigure(3, weight=1)
 
         # --- Log file list ---
-        list_frame = ttk.LabelFrame(self.root, text="Match Logs on Robot", padding=8)
+        list_frame = ttk.LabelFrame(self.root, text="Match Logs", padding=8)
         list_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
 
         columns = ("filename", "event", "match", "size", "status", "tba_video", "video_dl")
@@ -222,7 +224,12 @@ class LogPullerApp:
         if d:
             self.dir_var.set(d)
             self._save_current_config()
+            # Clear tree and reload from new directory
+            for iid in self.tree.get_children():
+                self.tree.delete(iid)
             self._scan_existing_downloads()
+            self._show_local_logs()
+            self._queue_video_lookups()
 
     def _scan_existing_downloads(self):
         """Scan the download directory for already-downloaded log and video files."""
@@ -242,6 +249,7 @@ class LogPullerApp:
                 self._downloaded.add(f.name)
                 log = parse_match_log(f.name)
                 if log:
+                    log["size"] = f.stat().st_size
                     has_video = f.stem in video_stems
                     self._video_status[f.name] = {
                         "tba": "found" if has_video else "unchecked",
@@ -249,6 +257,43 @@ class LogPullerApp:
                         "dl": "downloaded" if has_video else "not_downloaded",
                         "log": log,
                     }
+
+    def _show_local_logs(self):
+        """Populate the treeview with locally downloaded log files."""
+        existing_ids = set(self.tree.get_children())
+        dl_dir = self.dir_var.get().strip()
+
+        for fname, vs in self._video_status.items():
+            log = vs["log"]
+            match_str = f"{log['match_type']}{log['match_number']}"
+            size_mb = log.get("size", 0) / (1024 * 1024)
+            size_str = f"{size_mb:.1f} MB"
+
+            tba = vs.get("tba", "unchecked")
+            dl = vs.get("dl", "not_downloaded")
+            tba_text = self._tba_display(tba)
+            dl_text = self._dl_display(dl)
+            tag = self._video_row_tag(tba, dl)
+
+            values = (fname, log["event"], match_str, size_str, "Downloaded",
+                      tba_text, dl_text)
+
+            if fname in existing_ids:
+                self.tree.item(fname, values=values, tags=(tag,) if tag else ())
+            else:
+                self.tree.insert(
+                    "", tk.END, iid=fname, values=values,
+                    tags=(tag,) if tag else (),
+                )
+
+    def _queue_video_lookups(self):
+        """Queue TBA lookups for local logs that don't have videos yet."""
+        if not self.tba:
+            return
+        for fname, vs in self._video_status.items():
+            if vs["dl"] != "downloaded" and vs["tba"] == "unchecked":
+                self._video_queue.append(vs["log"])
+        self._maybe_start_video_download()
 
     def _set_status(self, connected: bool):
         """Update the connection status indicator (must be called from main thread)."""
@@ -337,9 +382,9 @@ class LogPullerApp:
                     tags=(tag,) if tag else (),
                 )
 
-        # Remove items no longer on the robot
+        # Remove items no longer on the robot and not locally downloaded
         for iid in existing_ids:
-            if iid not in current_filenames:
+            if iid not in current_filenames and iid not in self._downloaded:
                 self.tree.delete(iid)
 
     def _refresh_video_status(self, fname: str):
