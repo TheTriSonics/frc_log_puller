@@ -63,6 +63,12 @@ class LogPullerApp:
         self._video_queue: list[dict] = []
         self._downloading_video = False
 
+        # Per-file video status: {filename: {"tba": str, "video_url": str|None,
+        #   "dl": str, "log": dict}}
+        # tba: "unchecked" | "checking" | "found" | "not_found" | "error"
+        # dl:  "not_downloaded" | "downloading" | "downloaded" | "error"
+        self._video_status: dict[str, dict] = {}
+
         # Threads
         self._poll_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
@@ -75,8 +81,8 @@ class LogPullerApp:
     def _build_gui(self):
         self.root = tk.Tk()
         self.root.title("FRC Log Puller")
-        self.root.geometry("850x600")
-        self.root.minsize(700, 450)
+        self.root.geometry("950x600")
+        self.root.minsize(800, 450)
 
         # --- Settings frame ---
         settings_frame = ttk.LabelFrame(self.root, text="Settings", padding=8)
@@ -131,29 +137,42 @@ class LogPullerApp:
         list_frame = ttk.LabelFrame(self.root, text="Match Logs on Robot", padding=8)
         list_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
 
-        columns = ("filename", "event", "match", "size", "status")
+        columns = ("filename", "event", "match", "size", "status", "tba_video", "video_dl")
         self.tree = ttk.Treeview(list_frame, columns=columns, show="headings")
         self.tree.heading("filename", text="Filename")
         self.tree.heading("event", text="Event")
         self.tree.heading("match", text="Match")
         self.tree.heading("size", text="Size")
-        self.tree.heading("status", text="Status")
-        self.tree.column("filename", width=350)
+        self.tree.heading("status", text="Log Status")
+        self.tree.heading("tba_video", text="TBA Video")
+        self.tree.heading("video_dl", text="Video DL")
+        self.tree.column("filename", width=300)
         self.tree.column("event", width=80)
         self.tree.column("match", width=60)
-        self.tree.column("size", width=80)
-        self.tree.column("status", width=150)
+        self.tree.column("size", width=70)
+        self.tree.column("status", width=100)
+        self.tree.column("tba_video", width=110)
+        self.tree.column("video_dl", width=110)
+
+        # Row color tags for video status
+        self.tree.tag_configure("video_complete", foreground="#16a34a")
+        self.tree.tag_configure("video_ready", foreground="#2563eb")
+        self.tree.tag_configure("video_unavailable", foreground="#dc2626")
+        self.tree.tag_configure("video_error", foreground="#dc2626")
 
         scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=scrollbar.set)
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # --- Status bar ---
+        # --- Status bar with retry button ---
         status_bar = ttk.Frame(self.root, padding=(8, 4))
         status_bar.pack(fill=tk.X, side=tk.BOTTOM)
         self.activity_label = ttk.Label(status_bar, text="Ready")
         self.activity_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(
+            status_bar, text="Retry Video Download", command=self._retry_video
+        ).pack(side=tk.RIGHT)
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -206,14 +225,30 @@ class LogPullerApp:
             self._scan_existing_downloads()
 
     def _scan_existing_downloads(self):
-        """Scan the download directory for already-downloaded log files."""
+        """Scan the download directory for already-downloaded log and video files."""
         self._downloaded.clear()
+        self._video_status.clear()
         dl_dir = self.dir_var.get().strip()
         if not dl_dir or not Path(dl_dir).is_dir():
             return
+
+        video_stems = set()
+        for f in Path(dl_dir).iterdir():
+            if f.suffix == ".mp4":
+                video_stems.add(f.stem)
+
         for f in Path(dl_dir).iterdir():
             if f.suffix == ".wpilog" and is_match_log(f.name):
                 self._downloaded.add(f.name)
+                log = parse_match_log(f.name)
+                if log:
+                    has_video = f.stem in video_stems
+                    self._video_status[f.name] = {
+                        "tba": "found" if has_video else "unchecked",
+                        "video_url": None,
+                        "dl": "downloaded" if has_video else "not_downloaded",
+                        "log": log,
+                    }
 
     def _set_status(self, connected: bool):
         """Update the connection status indicator (must be called from main thread)."""
@@ -227,6 +262,43 @@ class LogPullerApp:
     def _set_activity(self, text: str):
         """Update the status bar text (must be called from main thread)."""
         self.activity_label.config(text=text)
+
+    @staticmethod
+    def _tba_display(status: str) -> str:
+        """Return display text for a TBA video availability status."""
+        if status == "found":
+            return "\u25cf Found"
+        if status == "not_found":
+            return "\u25cf Not Found"
+        if status == "error":
+            return "\u25cf Error"
+        if status == "checking":
+            return "Checking..."
+        return "\u2014"
+
+    @staticmethod
+    def _dl_display(status: str) -> str:
+        """Return display text for a video download status."""
+        if status == "downloaded":
+            return "\u25cf Downloaded"
+        if status == "downloading":
+            return "Downloading..."
+        if status == "error":
+            return "\u25cf Error"
+        return "\u2014"
+
+    @staticmethod
+    def _video_row_tag(tba: str, dl: str) -> str:
+        """Return the row color tag based on combined video status."""
+        if dl == "downloaded":
+            return "video_complete"
+        if tba == "found":
+            return "video_ready"
+        if tba == "not_found":
+            return "video_unavailable"
+        if tba == "error" or dl == "error":
+            return "video_error"
+        return ""
 
     def _update_tree(self, logs: list[dict]):
         """Update the treeview with the current log list (main thread)."""
@@ -248,17 +320,41 @@ class LogPullerApp:
             else:
                 status = "New"
 
-            values = (fname, log["event"], match_str, size_str, status)
+            vs = self._video_status.get(fname, {})
+            tba = vs.get("tba", "unchecked")
+            dl = vs.get("dl", "not_downloaded")
+            tba_text = self._tba_display(tba)
+            dl_text = self._dl_display(dl)
+            tag = self._video_row_tag(tba, dl)
+
+            values = (fname, log["event"], match_str, size_str, status, tba_text, dl_text)
 
             if fname in existing_ids:
-                self.tree.item(fname, values=values)
+                self.tree.item(fname, values=values, tags=(tag,) if tag else ())
             else:
-                self.tree.insert("", tk.END, iid=fname, values=values)
+                self.tree.insert(
+                    "", tk.END, iid=fname, values=values,
+                    tags=(tag,) if tag else (),
+                )
 
         # Remove items no longer on the robot
         for iid in existing_ids:
             if iid not in current_filenames:
                 self.tree.delete(iid)
+
+    def _refresh_video_status(self, fname: str):
+        """Update video status columns and row tag for a file (main thread)."""
+        vs = self._video_status.get(fname, {})
+        tba = vs.get("tba", "unchecked")
+        dl = vs.get("dl", "not_downloaded")
+        tag = self._video_row_tag(tba, dl)
+        try:
+            values = list(self.tree.item(fname, "values"))
+            values[5] = self._tba_display(tba)
+            values[6] = self._dl_display(dl)
+            self.tree.item(fname, values=values, tags=(tag,) if tag else ())
+        except tk.TclError:
+            pass
 
     def _start_polling(self):
         """Start the background thread that polls the roboRIO."""
@@ -352,6 +448,13 @@ class LogPullerApp:
                 self.root.after(
                     0, self._set_activity, f"Download complete: {fname}"
                 )
+                # Initialize video status tracking
+                self._video_status[fname] = {
+                    "tba": "unchecked",
+                    "video_url": None,
+                    "dl": "not_downloaded",
+                    "log": log,
+                }
                 # Queue video download if TBA is configured
                 if self.tba:
                     self._video_queue.append(log)
@@ -381,7 +484,7 @@ class LogPullerApp:
         t.start()
 
     def _video_download_worker(self):
-        """Worker thread that downloads match videos from YouTube."""
+        """Worker thread that looks up and downloads match videos."""
         while self._video_queue and not self._stop_event.is_set():
             log = self._video_queue.pop(0)
             fname = log["filename"]
@@ -390,15 +493,28 @@ class LogPullerApp:
             if not dl_dir or not self.tba:
                 break
 
-            # Build video output name to match log file
-            base_name = Path(fname).stem  # e.g., FRC_20260321_153505_MIBKN_Q5
+            # Ensure video status entry exists
+            if fname not in self._video_status:
+                self._video_status[fname] = {
+                    "tba": "unchecked", "video_url": None,
+                    "dl": "not_downloaded", "log": log,
+                }
+
+            # Check if video already downloaded
+            base_name = Path(fname).stem
             video_path = Path(dl_dir) / f"{base_name}.mp4"
             if video_path.exists():
+                self._video_status[fname]["tba"] = "found"
+                self._video_status[fname]["dl"] = "downloaded"
+                self.root.after(0, self._refresh_video_status, fname)
                 self.root.after(
                     0, self._set_activity, f"Video already exists: {base_name}.mp4"
                 )
                 continue
 
+            # TBA lookup
+            self._video_status[fname]["tba"] = "checking"
+            self.root.after(0, self._refresh_video_status, fname)
             self.root.after(
                 0, self._set_activity, f"Looking up match video for {fname}..."
             )
@@ -406,6 +522,8 @@ class LogPullerApp:
             try:
                 urls = self.tba.get_video_urls_for_log(log)
             except Exception as e:
+                self._video_status[fname]["tba"] = "error"
+                self.root.after(0, self._refresh_video_status, fname)
                 error_msg = str(e)
                 self.root.after(
                     0,
@@ -416,6 +534,8 @@ class LogPullerApp:
                 continue
 
             if not urls:
+                self._video_status[fname]["tba"] = "not_found"
+                self.root.after(0, self._refresh_video_status, fname)
                 self.root.after(
                     0,
                     self._set_activity,
@@ -423,8 +543,15 @@ class LogPullerApp:
                 )
                 continue
 
-            # Download the first (best) video
+            # Video found on TBA
+            self._video_status[fname]["tba"] = "found"
+            self._video_status[fname]["video_url"] = urls[0]
+            self.root.after(0, self._refresh_video_status, fname)
+
+            # Download the video
             url = urls[0]
+            self._video_status[fname]["dl"] = "downloading"
+            self.root.after(0, self._refresh_video_status, fname)
             self.root.after(
                 0, self._set_activity, f"Downloading video for {base_name}..."
             )
@@ -437,18 +564,24 @@ class LogPullerApp:
                     url, dl_dir, base_name, progress_callback=video_progress
                 )
                 if result:
+                    self._video_status[fname]["dl"] = "downloaded"
+                    self.root.after(0, self._refresh_video_status, fname)
                     self.root.after(
                         0,
                         self._set_activity,
                         f"Video downloaded: {result.name}",
                     )
                 else:
+                    self._video_status[fname]["dl"] = "error"
+                    self.root.after(0, self._refresh_video_status, fname)
                     self.root.after(
                         0,
                         self._set_activity,
                         f"Video download produced no output for {base_name}",
                     )
             except Exception as e:
+                self._video_status[fname]["dl"] = "error"
+                self.root.after(0, self._refresh_video_status, fname)
                 error_msg = str(e)
                 self.root.after(
                     0,
@@ -458,6 +591,49 @@ class LogPullerApp:
                 )
 
         self._downloading_video = False
+
+    def _retry_video(self):
+        """Retry TBA lookup and video download for selected items."""
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showinfo(
+                "Retry Video", "Select one or more log files to retry."
+            )
+            return
+        if not self.tba:
+            messagebox.showwarning(
+                "Retry Video", "TBA API key is not configured."
+            )
+            return
+        dl_dir = self.dir_var.get().strip()
+        if not dl_dir:
+            messagebox.showwarning("Retry Video", "No download directory set.")
+            return
+
+        queued = 0
+        for fname in selected:
+            vs = self._video_status.get(fname)
+            if not vs:
+                continue
+            # Skip if already downloaded or currently in progress
+            if vs["dl"] == "downloaded":
+                continue
+            if vs["dl"] == "downloading" or vs["tba"] == "checking":
+                continue
+            # Skip if log not downloaded yet
+            if fname not in self._downloaded:
+                continue
+            # Reset and re-queue
+            vs["tba"] = "unchecked"
+            vs["video_url"] = None
+            vs["dl"] = "not_downloaded"
+            self.root.after(0, self._refresh_video_status, fname)
+            self._video_queue.append(vs["log"])
+            queued += 1
+
+        if queued:
+            self._set_activity(f"Queued {queued} video(s) for retry")
+            self._maybe_start_video_download()
 
     def _show_internet_error(self, title: str, detail: str):
         """Show an error dialog with technical details and VPN reminder."""

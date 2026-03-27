@@ -84,7 +84,7 @@ class TBAClient:
 
         code_lower = first_event_code.lower()
         for event in self._events_cache[year]:
-            if event.get("first_event_code", "").lower() == code_lower:
+            if (event.get("first_event_code") or "").lower() == code_lower:
                 return event["key"]
 
         logger.warning(
